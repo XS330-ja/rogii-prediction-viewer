@@ -17,6 +17,7 @@ import pandas as pd
 DATA_DIR = Path(__file__).parent
 PRED_EXP010 = DATA_DIR / "pred_exp010.csv"
 OOF_PARQUET = DATA_DIR / "models" / "physics-informed-baseline" / "artefacts" / "oof_predictions.parquet"
+HEURISTIC026 = DATA_DIR / "public_notebook_heuristic_exp026.csv"
 TRAIN_DIR = DATA_DIR / "train"
 OUT_DIR = DATA_DIR / "app_data"
 
@@ -39,9 +40,20 @@ def main() -> None:
 
     df = pred.merge(oof, on="id", how="inner")
     df["oof_tvt"] = (df["oof_lgb1"] + (df["tvt_true"] - df["target"])).astype("float32")
+
+    # heuristic exp026 を追加 (id を持たないため row_idx を復元して結合)
+    print("読み込み: public_notebook_heuristic_exp026.csv …")
+    heu = pd.read_csv(HEURISTIC026, usecols=["well", "MD", "tvt_pred"]).rename(columns={"tvt_pred": "heu026"})
+    ps_map = {str(k): int(v) for k, v in pred.groupby("well", observed=True)["row_idx"].min().items()}
+    heu = heu.sort_values(["well", "MD"])
+    heu["row_idx"] = heu.groupby("well").cumcount() + heu["well"].map(ps_map).astype("int64")
+    heu["id"] = heu["well"] + "_" + heu["row_idx"].astype(str)
+    df = df.merge(heu[["id", "heu026"]], on="id", how="left")
+    df["heu026"] = df["heu026"].astype("float32")
+
     df = df[df["eval_mask"] == 1.0].sort_values(["well", "row_idx"]).reset_index(drop=True)
     df["rank_in_well"] = df.groupby("well", observed=True).cumcount().astype("int32")
-    pred_df = df[["well", "row_idx", "rank_in_well", "fold", "tvt_pred", "oof_tvt", "tvt_true"]].copy()
+    pred_df = df[["well", "row_idx", "rank_in_well", "fold", "tvt_pred", "oof_tvt", "heu026", "tvt_true"]].copy()
     pred_df["well"] = pred_df["well"].astype("category")
     pred_df.to_parquet(OUT_DIR / "predictions.parquet", compression="zstd", index=False)
     print(f"  ✔ predictions.parquet  rows={len(pred_df):,}")
@@ -84,6 +96,7 @@ def main() -> None:
             "fold": int(sub["fold"].iloc[0]),
             "rmse_NN": rmse(yt, sub["tvt_pred"].to_numpy()),
             "rmse_LGB": rmse(yt, sub["oof_tvt"].to_numpy()),
+            "rmse_HEU026": rmse(yt, sub["heu026"].to_numpy()),
         })
     summary = pd.DataFrame(rows)
     summary.to_parquet(OUT_DIR / "well_summary.parquet", compression="zstd", index=False)

@@ -26,11 +26,15 @@ COLOR_TRUE = "#111111"   # 実測値 (予測区間)
 COLOR_KNOWN = "#9A9A9A"  # 既知区間 (予測区間以前) の実測 TVT
 COLOR_NN = "#2A6FB8"     # LSTM
 COLOR_LGB = "#E45756"    # physics LGB
+COLOR_HEU026 = "#F58518" # heuristic exp026
 COLOR_BLEND = "#54A24B"  # blend
 
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not m.any():
+        return float("nan")
+    return float(np.sqrt(np.mean((y_true[m] - y_pred[m]) ** 2)))
 
 
 @st.cache_data(show_spinner="データ読み込み中 …")
@@ -79,6 +83,12 @@ def plot_well(sub, w_nn, x_col, show, known, split_x):
             line=dict(color=COLOR_LGB, width=1.4),
             hovertemplate=f"{x_col}=%{{x}}<br>LGB=%{{y:.2f}}<extra></extra>",
         ))
+    if show["heu026"]:
+        fig.add_trace(go.Scatter(
+            x=x, y=sub["heu026"], mode="lines", name="heuristic exp026",
+            line=dict(color=COLOR_HEU026, width=1.4),
+            hovertemplate=f"{x_col}=%{{x}}<br>heu026=%{{y:.2f}}<extra></extra>",
+        ))
     if show["blend"]:
         fig.add_trace(go.Scatter(
             x=x, y=blend, mode="lines", name=f"blend (NN {w_nn:.1f} : LGB {1 - w_nn:.1f})",
@@ -113,6 +123,9 @@ def plot_residual(sub, w_nn, x_col, show):
     if show["lgb"]:
         fig.add_trace(go.Scatter(x=x, y=sub["oof_tvt"].to_numpy() - yt, mode="lines",
                                  name="LGB", line=dict(color=COLOR_LGB, width=1.2)))
+    if show["heu026"]:
+        fig.add_trace(go.Scatter(x=x, y=sub["heu026"].to_numpy() - yt, mode="lines",
+                                 name="heu026", line=dict(color=COLOR_HEU026, width=1.2)))
     if show["blend"]:
         fig.add_trace(go.Scatter(x=x, y=blend - yt, mode="lines",
                                  name="blend", line=dict(color=COLOR_BLEND, width=1.4, dash="dot")))
@@ -130,7 +143,7 @@ def plot_residual(sub, w_nn, x_col, show):
 def main() -> None:
     st.set_page_config(page_title="Prediction Viewer", layout="wide")
     st.title("実測 vs 予測 Viewer (per well)")
-    st.caption("pred_exp010 (LSTM) と physics LGB の OOF を well ごとに比較")
+    st.caption("pred_exp010 (LSTM) / physics LGB / heuristic exp026 の OOF を well ごとに比較")
 
     if not PRED_PARQUET.exists():
         st.error("app_data/predictions.parquet が見つかりません。build_app_data.py を実行してください。")
@@ -142,11 +155,16 @@ def main() -> None:
 
     with st.sidebar:
         st.header("設定")
-        sort_by = st.selectbox("well 並び順", ["well 名", "NN が苦手な順", "LGB が苦手な順", "行数が多い順"])
+        sort_by = st.selectbox(
+            "well 並び順",
+            ["well 名", "NN が苦手な順", "LGB が苦手な順", "heu026 が苦手な順", "行数が多い順"],
+        )
         if sort_by == "NN が苦手な順":
             ordered = summary.sort_values("rmse_NN", ascending=False).index.tolist()
         elif sort_by == "LGB が苦手な順":
             ordered = summary.sort_values("rmse_LGB", ascending=False).index.tolist()
+        elif sort_by == "heu026 が苦手な順":
+            ordered = summary.sort_values("rmse_HEU026", ascending=False).index.tolist()
         elif sort_by == "行数が多い順":
             ordered = summary.sort_values("n_rows", ascending=False).index.tolist()
         else:
@@ -164,6 +182,7 @@ def main() -> None:
             "true": st.checkbox("実測 (tvt_true, 予測区間)", value=True),
             "nn": st.checkbox("NN (LSTM)", value=True),
             "lgb": st.checkbox("physics LGB", value=True),
+            "heu026": st.checkbox("heuristic exp026", value=True),
             "blend": st.checkbox("blend", value=True),
         }
         show_resid = st.checkbox("残差プロットを表示", value=True)
@@ -177,12 +196,13 @@ def main() -> None:
     split_x = 0.0 if x_col == "rank_in_well" else float(pred_start)
 
     st.subheader(f"well: `{well}`")
-    c = st.columns(5)
+    c = st.columns(6)
     c[0].metric("予測区間 行数", f"{len(sub):,}")
-    c[1].metric("既知区間 行数", f"{len(known):,}")
-    c[2].metric("RMSE NN", f"{rmse(yt, sub['tvt_pred'].to_numpy()):.3f}")
-    c[3].metric("RMSE LGB", f"{rmse(yt, sub['oof_tvt'].to_numpy()):.3f}")
+    c[1].metric("RMSE NN", f"{rmse(yt, sub['tvt_pred'].to_numpy()):.3f}")
+    c[2].metric("RMSE LGB", f"{rmse(yt, sub['oof_tvt'].to_numpy()):.3f}")
+    c[3].metric("RMSE heu026", f"{rmse(yt, sub['heu026'].to_numpy()):.3f}")
     c[4].metric(f"RMSE blend ({w_nn:.1f})", f"{rmse(yt, blend):.3f}")
+    c[5].metric("既知区間 行数", f"{len(known):,}")
 
     st.plotly_chart(plot_well(sub, w_nn, x_col, show, known, split_x), width="stretch")
     if show_resid:

@@ -22,6 +22,7 @@ import streamlit as st
 DATA_DIR = Path(__file__).parent
 PRED_EXP010 = DATA_DIR / "pred_exp010.csv"
 OOF_PARQUET = DATA_DIR / "models" / "physics-informed-baseline" / "artefacts" / "oof_predictions.parquet"
+HEURISTIC026 = DATA_DIR / "public_notebook_heuristic_exp026.csv"
 TRAIN_DIR = DATA_DIR / "train"
 
 # 系列ごとの色
@@ -29,16 +30,20 @@ COLOR_TRUE = "#111111"   # 実測値 (予測区間)
 COLOR_KNOWN = "#9A9A9A"  # 既知区間 (予測区間以前) の実測 TVT
 COLOR_NN = "#2A6FB8"     # LSTM
 COLOR_LGB = "#E45756"    # physics LGB
+COLOR_HEU026 = "#F58518" # heuristic exp026
 COLOR_BLEND = "#54A24B"  # blend
 
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    m = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not m.any():
+        return float("nan")
+    return float(np.sqrt(np.mean((y_true[m] - y_pred[m]) ** 2)))
 
 
 @st.cache_data(show_spinner="予測ファイルを読み込み中 …")
 def load_data() -> pd.DataFrame:
-    """2 ファイルを結合し、LGB を絶対 TVT へ戻した DataFrame を返す。"""
+    """各ファイルを結合し、LGB を絶対 TVT へ戻した DataFrame を返す。"""
     pred = pd.read_csv(
         PRED_EXP010,
         usecols=["well", "row_idx", "id", "tvt_pred", "fold", "eval_mask", "tvt_true"],
@@ -49,9 +54,23 @@ def load_data() -> pd.DataFrame:
     df = pred.merge(oof, on="id", how="inner")
     # LGB オフセット予測 → 絶対 TVT
     df["oof_tvt"] = (df["oof_lgb1"] + (df["tvt_true"] - df["target"])).astype("float32")
+
+    # heuristic exp026 を追加。id を持たないため row_idx を復元して結合
+    # (ROGII(Blending).ipynb と同じ: row_idx = 予測開始 + well 内 MD 順位)。
+    if HEURISTIC026.exists():
+        heu = pd.read_csv(HEURISTIC026, usecols=["well", "MD", "tvt_pred"]).rename(columns={"tvt_pred": "heu026"})
+        pred_start = {str(k): int(v) for k, v in pred.groupby("well", observed=True)["row_idx"].min().items()}
+        heu = heu.sort_values(["well", "MD"])
+        heu["row_idx"] = heu.groupby("well").cumcount() + heu["well"].map(pred_start).astype("int64")
+        heu["id"] = heu["well"] + "_" + heu["row_idx"].astype(str)
+        df = df.merge(heu[["id", "heu026"]], on="id", how="left")
+        df["heu026"] = df["heu026"].astype("float32")
+    else:
+        df["heu026"] = np.float32("nan")
+
     df = df[df["eval_mask"] == 1.0].sort_values(["well", "row_idx"]).reset_index(drop=True)
     df["rank_in_well"] = df.groupby("well", observed=True).cumcount().astype("int32")
-    return df[["well", "row_idx", "rank_in_well", "fold", "tvt_pred", "oof_tvt", "tvt_true"]]
+    return df[["well", "row_idx", "rank_in_well", "fold", "tvt_pred", "oof_tvt", "heu026", "tvt_true"]]
 
 
 @st.cache_data(show_spinner=False)
@@ -65,6 +84,7 @@ def well_summary(df: pd.DataFrame) -> pd.DataFrame:
             "n_rows": len(sub),
             "rmse_NN": rmse(yt, sub["tvt_pred"].to_numpy()),
             "rmse_LGB": rmse(yt, sub["oof_tvt"].to_numpy()),
+            "rmse_HEU026": rmse(yt, sub["heu026"].to_numpy()),
         })
     return pd.DataFrame(rows).set_index("well")
 
@@ -124,6 +144,12 @@ def plot_well(
             line=dict(color=COLOR_LGB, width=1.4),
             hovertemplate=f"{x_col}=%{{x}}<br>LGB=%{{y:.2f}}<extra></extra>",
         ))
+    if show["heu026"]:
+        fig.add_trace(go.Scatter(
+            x=x, y=sub["heu026"], mode="lines", name="heuristic exp026",
+            line=dict(color=COLOR_HEU026, width=1.4),
+            hovertemplate=f"{x_col}=%{{x}}<br>heu026=%{{y:.2f}}<extra></extra>",
+        ))
     if show["blend"]:
         fig.add_trace(go.Scatter(
             x=x, y=blend, mode="lines", name=f"blend (NN {w_nn:.1f} : LGB {1 - w_nn:.1f})",
@@ -159,6 +185,9 @@ def plot_residual(sub: pd.DataFrame, w_nn: float, x_col: str, show: dict[str, bo
     if show["lgb"]:
         fig.add_trace(go.Scatter(x=x, y=sub["oof_tvt"].to_numpy() - yt, mode="lines",
                                  name="LGB", line=dict(color=COLOR_LGB, width=1.2)))
+    if show["heu026"]:
+        fig.add_trace(go.Scatter(x=x, y=sub["heu026"].to_numpy() - yt, mode="lines",
+                                 name="heu026", line=dict(color=COLOR_HEU026, width=1.2)))
     if show["blend"]:
         fig.add_trace(go.Scatter(x=x, y=blend - yt, mode="lines",
                                  name="blend", line=dict(color=COLOR_BLEND, width=1.4, dash="dot")))
@@ -177,7 +206,7 @@ def plot_residual(sub: pd.DataFrame, w_nn: float, x_col: str, show: dict[str, bo
 def main() -> None:
     st.set_page_config(page_title="Prediction Viewer", layout="wide")
     st.title("実測 vs 予測 Viewer (per well)")
-    st.caption("pred_exp010 (LSTM) と physics LGB の OOF を well ごとに比較")
+    st.caption("pred_exp010 (LSTM) / physics LGB / heuristic exp026 の OOF を well ごとに比較")
 
     if not PRED_EXP010.exists() or not OOF_PARQUET.exists():
         st.error("pred_exp010.csv または oof_predictions.parquet が見つかりません。")
@@ -190,12 +219,15 @@ def main() -> None:
     with st.sidebar:
         st.header("設定")
         sort_by = st.selectbox(
-            "well 並び順", ["well 名", "NN が苦手な順", "LGB が苦手な順", "行数が多い順"]
+            "well 並び順",
+            ["well 名", "NN が苦手な順", "LGB が苦手な順", "heu026 が苦手な順", "行数が多い順"],
         )
         if sort_by == "NN が苦手な順":
             ordered = summary.sort_values("rmse_NN", ascending=False).index.tolist()
         elif sort_by == "LGB が苦手な順":
             ordered = summary.sort_values("rmse_LGB", ascending=False).index.tolist()
+        elif sort_by == "heu026 が苦手な順":
+            ordered = summary.sort_values("rmse_HEU026", ascending=False).index.tolist()
         elif sort_by == "行数が多い順":
             ordered = summary.sort_values("n_rows", ascending=False).index.tolist()
         else:
@@ -213,6 +245,7 @@ def main() -> None:
             "true": st.checkbox("実測 (tvt_true, 予測区間)", value=True),
             "nn": st.checkbox("NN (LSTM)", value=True),
             "lgb": st.checkbox("physics LGB", value=True),
+            "heu026": st.checkbox("heuristic exp026", value=True),
             "blend": st.checkbox("blend", value=True),
         }
         show_resid = st.checkbox("残差プロットを表示", value=True)
@@ -227,12 +260,13 @@ def main() -> None:
     split_x = 0.0 if x_col == "rank_in_well" else float(pred_start)
 
     st.subheader(f"well: `{well}`")
-    c = st.columns(5)
+    c = st.columns(6)
     c[0].metric("予測区間 行数", f"{len(sub):,}")
-    c[1].metric("既知区間 行数", f"{0 if known is None else len(known):,}")
-    c[2].metric("RMSE NN", f"{rmse(yt, sub['tvt_pred'].to_numpy()):.3f}")
-    c[3].metric("RMSE LGB", f"{rmse(yt, sub['oof_tvt'].to_numpy()):.3f}")
+    c[1].metric("RMSE NN", f"{rmse(yt, sub['tvt_pred'].to_numpy()):.3f}")
+    c[2].metric("RMSE LGB", f"{rmse(yt, sub['oof_tvt'].to_numpy()):.3f}")
+    c[3].metric("RMSE heu026", f"{rmse(yt, sub['heu026'].to_numpy()):.3f}")
     c[4].metric(f"RMSE blend ({w_nn:.1f})", f"{rmse(yt, blend):.3f}")
+    c[5].metric("既知区間 行数", f"{0 if known is None else len(known):,}")
 
     st.plotly_chart(plot_well(sub, w_nn, x_col, show, known=known, split_x=split_x), width='stretch')
     if show_resid:
