@@ -37,18 +37,25 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((y_true[m] - y_pred[m]) ** 2)))
 
 
+def _sig(path: Path) -> tuple[int, int]:
+    """ファイルの (更新時刻, サイズ) を返す。キャッシュキーに含めることで、
+    parquet が更新されたら (= 再デプロイ時) 自動でキャッシュを無効化する。"""
+    s = path.stat()
+    return (s.st_mtime_ns, s.st_size)
+
+
 @st.cache_data(show_spinner="データ読み込み中 …")
-def load_predictions() -> pd.DataFrame:
+def load_predictions(sig: tuple[int, int]) -> pd.DataFrame:
     return pd.read_parquet(PRED_PARQUET)
 
 
 @st.cache_data(show_spinner=False)
-def load_summary() -> pd.DataFrame:
+def load_summary(sig: tuple[int, int]) -> pd.DataFrame:
     return pd.read_parquet(SUMMARY_PARQUET).set_index("well")
 
 
 @st.cache_data(show_spinner=False)
-def load_known(well: str) -> pd.DataFrame:
+def load_known(well: str, sig: tuple[int, int]) -> pd.DataFrame:
     # 必要な well だけ読み出す (filters で I/O を最小化)
     k = pd.read_parquet(KNOWN_PARQUET, filters=[("well", "==", well)])
     return k[["row_idx", "rank_in_well", "tvt_known"]]
@@ -149,8 +156,8 @@ def main() -> None:
         st.error("app_data/predictions.parquet が見つかりません。build_app_data.py を実行してください。")
         st.stop()
 
-    df = load_predictions()
-    summary = load_summary()
+    df = load_predictions(_sig(PRED_PARQUET))
+    summary = load_summary(_sig(SUMMARY_PARQUET))
     wells = summary.index.tolist()
 
     with st.sidebar:
@@ -192,7 +199,7 @@ def main() -> None:
     blend = w_nn * sub["tvt_pred"].to_numpy() + (1 - w_nn) * sub["oof_tvt"].to_numpy()
 
     pred_start = int(sub["row_idx"].min())
-    known = load_known(well)
+    known = load_known(well, _sig(KNOWN_PARQUET))
     split_x = 0.0 if x_col == "rank_in_well" else float(pred_start)
 
     st.subheader(f"well: `{well}`")
