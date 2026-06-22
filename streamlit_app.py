@@ -16,11 +16,22 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 DATA_DIR = Path(__file__).parent / "app_data"
 PRED_PARQUET = DATA_DIR / "predictions.parquet"
 KNOWN_PARQUET = DATA_DIR / "known_tvt.parquet"
 SUMMARY_PARQUET = DATA_DIR / "well_summary.parquet"
+GEO_PARQUET = DATA_DIR / "well_geo.parquet"
+TYPEWELL_PARQUET = DATA_DIR / "typewell.parquet"
+TOPS_PARQUET = DATA_DIR / "formation_tops.parquet"
+
+FORMATIONS = ["ANCC", "ASTNU", "ASTNL", "EGFDU", "EGFDL", "BUDA"]
+FORM_COLORS = {
+    "ANCC": "#b22222", "ASTNU": "#ff7f0e", "ASTNL": "#2ca02c",
+    "EGFDU": "#006400", "EGFDL": "#17becf", "BUDA": "#e377c2",
+}
+COLOR_PATH = "#1f77b4"  # 坑跡
 
 COLOR_TRUE = "#111111"   # 実測値 (予測区間)
 COLOR_KNOWN = "#9A9A9A"  # 既知区間 (予測区間以前) の実測 TVT
@@ -59,6 +70,100 @@ def load_known(well: str, sig: tuple[int, int]) -> pd.DataFrame:
     # 必要な well だけ読み出す (filters で I/O を最小化)
     k = pd.read_parquet(KNOWN_PARQUET, filters=[("well", "==", well)])
     return k[["row_idx", "rank_in_well", "tvt_known"]]
+
+
+@st.cache_data(show_spinner=False)
+def load_geo(well: str, sig) -> pd.DataFrame | None:
+    if not GEO_PARQUET.exists():
+        return None
+    return pd.read_parquet(GEO_PARQUET, filters=[("well", "==", well)])
+
+
+@st.cache_data(show_spinner=False)
+def load_typewell(well: str, sig) -> pd.DataFrame | None:
+    if not TYPEWELL_PARQUET.exists():
+        return None
+    return pd.read_parquet(TYPEWELL_PARQUET, filters=[("well", "==", well)])
+
+
+@st.cache_data(show_spinner=False)
+def load_tops(well: str, sig) -> pd.DataFrame | None:
+    if not TOPS_PARQUET.exists():
+        return None
+    return pd.read_parquet(TOPS_PARQUET, filters=[("well", "==", well)])
+
+
+def plot_cross_section(geo: pd.DataFrame, tw: pd.DataFrame | None, tops: pd.DataFrame | None) -> go.Figure:
+    """配布 PNG 相当の断面図を 2x2 で再現:
+    [GR ログ | TVT-GR プロット] / [坑跡+地層面 | TVT-GR (深部200ft)]。"""
+    fig = make_subplots(
+        rows=2, cols=2,
+        column_widths=[0.55, 0.45], row_heights=[0.42, 0.58],
+        horizontal_spacing=0.09, vertical_spacing=0.12,
+        subplot_titles=("GR ログ", "TVT プロット (GR)", "坑跡と地層面", "TVT プロット (深部200ft)"),
+    )
+
+    md, gr = geo["md"].to_numpy(), geo["gr"].to_numpy()
+    hdist, z, tvt = geo["hdist"].to_numpy(), geo["z"].to_numpy(), geo["tvt"].to_numpy()
+    known_mask = geo["is_known"].to_numpy()
+
+    # --- (1,1) GR ログ: GR vs MD ---
+    fig.add_trace(go.Scatter(x=md, y=gr, mode="lines", name="GR",
+                             line=dict(color="#2e7d32", width=0.8), showlegend=False), row=1, col=1)
+
+    # --- (2,1) 坑跡 (Z vs 水平距離) + 地層面 ---
+    for f in FORMATIONS:
+        fig.add_trace(go.Scatter(x=hdist, y=geo[f].to_numpy(), mode="lines", name=f,
+                                 line=dict(color=FORM_COLORS[f], width=1.4),
+                                 legendgroup=f), row=2, col=1)
+    fig.add_trace(go.Scatter(x=hdist, y=z, mode="lines", name="坑跡",
+                             line=dict(color=COLOR_PATH, width=2.4), legendgroup="path"), row=2, col=1)
+    if (~known_mask).any():
+        j = int((~known_mask).argmax())
+        fig.add_trace(go.Scatter(x=[hdist[j]], y=[z[j]], mode="markers", name="予測開始",
+                                 marker=dict(color="red", size=11, line=dict(color="white", width=1.5)),
+                                 legendgroup="ps"), row=2, col=1)
+
+    # --- TVT-GR プロット (1,2) と 深部200ft (2,2) ---
+    for rc in [(1, 2), (2, 2)]:
+        r, c = rc
+        # 横坑 (既知=灰, 予測区間=赤)
+        fig.add_trace(go.Scatter(x=gr[known_mask], y=tvt[known_mask], mode="lines",
+                                 name="横坑 GR (既知)", line=dict(color="#9A9A9A", width=1.0),
+                                 legendgroup="hk", showlegend=(rc == (1, 2))), row=r, col=c)
+        fig.add_trace(go.Scatter(x=gr[~known_mask], y=tvt[~known_mask], mode="lines",
+                                 name="横坑 GR (予測区間)", line=dict(color="#E45756", width=1.0),
+                                 legendgroup="hp", showlegend=(rc == (1, 2))), row=r, col=c)
+        if tw is not None and len(tw):
+            fig.add_trace(go.Scatter(x=tw["gr"].to_numpy(), y=tw["tvt"].to_numpy(), mode="lines",
+                                     name="タイプ坑 GR", line=dict(color="#111111", width=1.0),
+                                     legendgroup="tw", showlegend=(rc == (1, 2))), row=r, col=c)
+        # 地層トップ (水平破線)
+        if tops is not None:
+            for _, t in tops.iterrows():
+                fig.add_hline(y=float(t["tvt"]), line=dict(color=FORM_COLORS.get(t["formation"], "#888"),
+                              width=1, dash="dash"), row=r, col=c)
+
+    fig.update_yaxes(autorange="reversed", row=1, col=2)
+    fig.update_yaxes(autorange="reversed", row=2, col=1)  # 深さ Z (負) を下向きに
+    # 深部 200ft ズーム
+    tmax = float(np.nanmax(tvt))
+    fig.update_yaxes(range=[tmax, tmax - 200], row=2, col=2)
+
+    fig.update_xaxes(title_text="MD (ft)", row=1, col=1)
+    fig.update_yaxes(title_text="GR", row=1, col=1)
+    fig.update_xaxes(title_text="水平距離 (ft)", row=2, col=1)
+    fig.update_yaxes(title_text="Depth Z (ft)", row=2, col=1)
+    fig.update_xaxes(title_text="GR", row=1, col=2)
+    fig.update_yaxes(title_text="TVT (ft)", row=1, col=2)
+    fig.update_xaxes(title_text="GR", row=2, col=2)
+    fig.update_yaxes(title_text="TVT (ft)", row=2, col=2)
+    fig.update_layout(
+        height=760,
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0, font=dict(size=10)),
+        margin=dict(l=50, r=20, t=70, b=40),
+    )
+    return fig
 
 
 def plot_well(sub, w_nn, x_col, show, known, split_x):
@@ -232,6 +337,14 @@ def main() -> None:
     st.plotly_chart(plot_well(sub, w_nn, x_col, show, known, split_x), width="stretch")
     if show_resid:
         st.plotly_chart(plot_residual(sub, w_nn, x_col, show), width="stretch")
+
+    # 配布 PNG 相当の断面図 (GR ログ / 坑跡+地層面 / TVT-GR) を plotly で再現
+    geo = load_geo(well, _sig(GEO_PARQUET)) if GEO_PARQUET.exists() else None
+    if geo is not None and len(geo):
+        st.markdown("#### 断面図 (配布 PNG 相当)")
+        tw = load_typewell(well, _sig(TYPEWELL_PARQUET))
+        tops = load_tops(well, _sig(TOPS_PARQUET))
+        st.plotly_chart(plot_cross_section(geo, tw, tops), width="stretch")
 
     with st.expander("well 別 RMSE 一覧 (全 well)"):
         st.dataframe(summary.round(3), width="stretch")
