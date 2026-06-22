@@ -89,14 +89,22 @@ def main() -> None:
     rows = []
     for w, sub in pred_df.groupby("well", observed=True):
         yt = sub["tvt_true"].to_numpy()
+        lgb = sub["oof_tvt"].to_numpy()
+        heu = sub["heu026"].to_numpy()
+        rmse_lgb = rmse(yt, lgb)
+        rmse_heu = rmse(yt, heu)
+        valid = np.isfinite(heu) & np.isfinite(lgb)
+        diff_pred = float(np.mean(np.abs(heu[valid] - lgb[valid]))) if valid.any() else float("nan")
         rows.append({
             "well": w,
             "n_rows": len(sub),
             "n_known": int(pred_start[w]),
             "fold": int(sub["fold"].iloc[0]),
             "rmse_NN": rmse(yt, sub["tvt_pred"].to_numpy()),
-            "rmse_LGB": rmse(yt, sub["oof_tvt"].to_numpy()),
-            "rmse_HEU026": rmse(yt, sub["heu026"].to_numpy()),
+            "rmse_LGB": rmse_lgb,
+            "rmse_HEU026": rmse_heu,
+            "diff_pred": diff_pred,            # |heu026 - LGB| の平均 (予測の乖離)
+            "diff_rmse": rmse_heu - rmse_lgb,  # 正: LGB 優位 / 負: heuristic 優位
         })
     summary = pd.DataFrame(rows)
     summary.to_parquet(OUT_DIR / "well_summary.parquet", compression="zstd", index=False)

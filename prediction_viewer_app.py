@@ -79,12 +79,21 @@ def well_summary(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for w, sub in df.groupby("well", observed=True):
         yt = sub["tvt_true"].to_numpy()
+        lgb = sub["oof_tvt"].to_numpy()
+        heu = sub["heu026"].to_numpy()
+        rmse_lgb = rmse(yt, lgb)
+        rmse_heu = rmse(yt, heu)
+        # heuristic と GBDT(LGB) の差分
+        valid = np.isfinite(heu) & np.isfinite(lgb)
+        diff_pred = float(np.mean(np.abs(heu[valid] - lgb[valid]))) if valid.any() else float("nan")
         rows.append({
             "well": w,
             "n_rows": len(sub),
             "rmse_NN": rmse(yt, sub["tvt_pred"].to_numpy()),
-            "rmse_LGB": rmse(yt, sub["oof_tvt"].to_numpy()),
-            "rmse_HEU026": rmse(yt, sub["heu026"].to_numpy()),
+            "rmse_LGB": rmse_lgb,
+            "rmse_HEU026": rmse_heu,
+            "diff_pred": diff_pred,            # |heu026 - LGB| の平均 (予測の乖離)
+            "diff_rmse": rmse_heu - rmse_lgb,  # RMSE差 (正: heuristic が劣る / 負: heuristic が優れる)
         })
     return pd.DataFrame(rows).set_index("well")
 
@@ -220,7 +229,9 @@ def main() -> None:
         st.header("設定")
         sort_by = st.selectbox(
             "well 並び順",
-            ["well 名", "NN が苦手な順", "LGB が苦手な順", "heu026 が苦手な順", "行数が多い順"],
+            ["well 名", "NN が苦手な順", "LGB が苦手な順", "heu026 が苦手な順",
+             "heu026↔LGB 予測差が大きい順", "heu026 が LGB より良い順", "LGB が heu026 より良い順",
+             "行数が多い順"],
         )
         if sort_by == "NN が苦手な順":
             ordered = summary.sort_values("rmse_NN", ascending=False).index.tolist()
@@ -228,6 +239,14 @@ def main() -> None:
             ordered = summary.sort_values("rmse_LGB", ascending=False).index.tolist()
         elif sort_by == "heu026 が苦手な順":
             ordered = summary.sort_values("rmse_HEU026", ascending=False).index.tolist()
+        elif sort_by == "heu026↔LGB 予測差が大きい順":
+            # 2 モデルの予測が最も食い違う well 順 (|heu026 - LGB| の平均)
+            ordered = summary.sort_values("diff_pred", ascending=False).index.tolist()
+        elif sort_by == "heu026 が LGB より良い順":
+            # diff_rmse = RMSE_heu - RMSE_LGB が小さい (負に大きい) ほど heuristic が優位
+            ordered = summary.sort_values("diff_rmse", ascending=True).index.tolist()
+        elif sort_by == "LGB が heu026 より良い順":
+            ordered = summary.sort_values("diff_rmse", ascending=False).index.tolist()
         elif sort_by == "行数が多い順":
             ordered = summary.sort_values("n_rows", ascending=False).index.tolist()
         else:
@@ -259,14 +278,24 @@ def main() -> None:
     known = load_known_tvt(well, pred_start)
     split_x = 0.0 if x_col == "rank_in_well" else float(pred_start)
 
+    rmse_lgb = rmse(yt, sub["oof_tvt"].to_numpy())
+    rmse_heu = rmse(yt, sub["heu026"].to_numpy())
+    heu_arr = sub["heu026"].to_numpy()
+    lgb_arr = sub["oof_tvt"].to_numpy()
+    vmask = np.isfinite(heu_arr) & np.isfinite(lgb_arr)
+    diff_pred = float(np.mean(np.abs(heu_arr[vmask] - lgb_arr[vmask]))) if vmask.any() else float("nan")
+
     st.subheader(f"well: `{well}`")
-    c = st.columns(6)
+    c = st.columns(7)
     c[0].metric("予測区間 行数", f"{len(sub):,}")
     c[1].metric("RMSE NN", f"{rmse(yt, sub['tvt_pred'].to_numpy()):.3f}")
-    c[2].metric("RMSE LGB", f"{rmse(yt, sub['oof_tvt'].to_numpy()):.3f}")
-    c[3].metric("RMSE heu026", f"{rmse(yt, sub['heu026'].to_numpy()):.3f}")
+    c[2].metric("RMSE LGB", f"{rmse_lgb:.3f}")
+    c[3].metric("RMSE heu026", f"{rmse_heu:.3f}")
     c[4].metric(f"RMSE blend ({w_nn:.1f})", f"{rmse(yt, blend):.3f}")
-    c[5].metric("既知区間 行数", f"{0 if known is None else len(known):,}")
+    c[5].metric("heu026↔LGB 予測差", f"{diff_pred:.3f}",
+                help="|heu026 − LGB| の平均 (予測の乖離)")
+    c[6].metric("RMSE差 (heu026−LGB)", f"{rmse_heu - rmse_lgb:+.3f}",
+                help="負: heuristic が優位 / 正: LGB が優位")
 
     st.plotly_chart(plot_well(sub, w_nn, x_col, show, known=known, split_x=split_x), width='stretch')
     if show_resid:
